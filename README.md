@@ -1,4 +1,5 @@
-# stock_agent
+# sec_filing_agent
+
 
 A local CLI agent that lets you ask natural-language questions about SEC filings using a RAG (Retrieval-Augmented Generation) pipeline powered by the Anthropic API, VoyageAI embeddings, and ChromaDB.
 
