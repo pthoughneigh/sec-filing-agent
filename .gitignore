@@ -1,0 +1,38 @@
+# Virtual environment
+.venv/
+
+# Environment variables
+.env
+
+# Vector store (large, regeneratable)
+chroma_db/
+
+# Auto-generated chunk files (regeneratable)
+text_files/
+
+# PDF filings (often confidential / large)
+documents/*.pdf
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution / build artifacts
+dist/
+build/
+*.egg-info/
+
+# IDE / editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Scratch files
+z.py
