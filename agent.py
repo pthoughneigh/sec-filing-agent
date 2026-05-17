@@ -20,7 +20,8 @@ from dotenv import load_dotenv
 from chunker import load_pdfs
 from config import (FILENAMES, HAIKU_INPUT_PRICE_PER_M, 
                    HAIKU_OUTPUT_PRICE_PER_M, SYSTEM_PROMPT, 
-                   CHAT_OUTPUT_FOLDER, TOP_K, N_PARAMETERS)
+                   CHAT_OUTPUT_FOLDER, TOP_K, N_PARAMETERS, 
+                   MAX_TOTAL_TURNS, INDEX_OF_LAST_SAVED_MESSAGE)
 from ingest import collection, ingest_all, vo
 
 # ---------------------------------------------------------------------------
@@ -285,6 +286,79 @@ def _rerank(
         ) from exc
 
     return reranked_docs, reranked_metas
+
+def _summarize_conversation(
+        conversation: list[dict]
+) -> list[dict]:
+    """Summarize the conversation to reduce token usage in future turns.
+    
+    Calls the Claude API to produce a summary of ``conversation``, then returns
+    a new list containing only the last 4 messages with the summary prepended
+    as the first message. Falls back to returning the original conversation
+    unchanged if any API error occurs.
+    
+    Args:
+        conversation: The full conversation history as a list of role/content dicts.
+    
+    Returns:
+        A new conversation list where older history is replaced by a single
+        summary message of the form:
+        ``{"role": "user", "content": "Summary of previous conversation: <text>"}``
+        or the original conversation if an API error occurs.
+    
+    Raises:
+        SystemExit: On unrecoverable API authentication errors (HTTP 401).
+    """
+
+    conversation = conversation.copy()
+
+    summarize_system_prompt = (
+        "You are a conversation summarizer. Given a conversation between a user and a financial assistant, "
+        "produce a concise summary that preserves: the user's questions and intent, key numerical data "
+        "(prices, percentages, figures) mentioned by the assistant, and important facts about any companies "
+        "discussed. The summary will be used as context for continuing the conversation, so prioritize "
+        "information the assistant would need to give consistent, accurate follow-up answers."
+    )
+
+    messages_to_summarize = conversation + [{"role": "user", "content": "Please summarize the conversation above."}]
+
+    try:
+        response = client.messages.create(
+            model='claude-haiku-4-5',
+            max_tokens=4096,
+            system=summarize_system_prompt,
+            messages=messages_to_summarize
+        )
+    except APITimeoutError:
+        log.error("API request timed out after 60s.")
+        return conversation
+    except APIStatusError as exc:
+        if exc.status_code == 401:
+            log.error("Invalid Anthropic API key — check your .env file.")
+            sys.exit(1)
+        if exc.status_code == 429:
+            log.warning("Rate limit hit (429).")
+            return conversation
+        log.error("Anthropic API error %d: %s", exc.status_code, exc.message)
+        return conversation
+    except APIConnectionError as exc:
+        log.error("Could not reach the Anthropic API: %s", exc)
+        return conversation
+
+    log.debug("Response: %s", response)
+
+    original = conversation.copy()
+    conversation = conversation[INDEX_OF_LAST_SAVED_MESSAGE:]
+    try:
+        conversation.insert(0, {"role": "user", "content": f"Summary of previous conversation: {response.content[0].text}"})
+    except IndexError as e:
+        log.error(f"Response content is empty: {e}")
+        return original
+
+    log.info("Summarization succeded.")
+    return conversation
+
+
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
@@ -483,7 +557,7 @@ def agent(messages: list[dict]) -> tuple[str, int, int]:
         try:
             response = client.messages.create(
                 model="claude-haiku-4-5",
-                max_tokens=1024,
+                max_tokens=4096,
                 system=[
                     {
                         'type': 'text',
@@ -589,6 +663,7 @@ def cli() -> None:
     conversation: list[dict] = []
     total_input_tokens = 0
     total_output_tokens = 0
+    total_turns = 0
 
     log.info("Stock Agent CLI started.")
     print("Stock Agent started. Commands: 'quit' to exit, 'clear' to reset.\n")
@@ -615,24 +690,32 @@ def cli() -> None:
 
         conversation.append({"role": "user", "content": user_input})
         snapshot = len(conversation)
-
+        
         answer, input_tokens, output_tokens = agent(conversation)
+        
         total_input_tokens += input_tokens
         total_output_tokens += output_tokens
 
         log.debug("Turn tokens — input: %d | output: %d", input_tokens, output_tokens)
-        print(f"claude: {answer}\n")
+        print(f"assistant: {answer}\n")
 
         if answer.startswith("[error]"):
             log.warning("Error response received — rolling back conversation to snapshot %d.", snapshot)
             del conversation[snapshot:]
         else:
+            # Removes tool_use response from conversation
+            conversation = conversation[:snapshot] 
             conversation.append(
                 {
                     "role": "assistant",
                     "content": [{"type": "text", "text": answer}],
                 }
             )
+
+        total_turns += 1
+        if total_turns >= MAX_TOTAL_TURNS:
+            conversation = _summarize_conversation(conversation)
+            total_turns = 0
 
     input_cost = (total_input_tokens / 1_000_000) * HAIKU_INPUT_PRICE_PER_M
     output_cost = (total_output_tokens / 1_000_000) * HAIKU_OUTPUT_PRICE_PER_M
@@ -648,7 +731,6 @@ def cli() -> None:
     print(f"Input tokens : {total_input_tokens:,}")
     print(f"Output tokens: {total_output_tokens:,}")
     print(f"Estimated cost: ${input_cost + output_cost:.6f}")
-
 
 if __name__ == "__main__":
     load_pdfs(FILENAMES)

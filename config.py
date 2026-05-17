@@ -75,3 +75,11 @@ CHAT_OUTPUT_FOLDER = Path(f"./chats/")
 
 TOP_K = 3
 N_PARAMETERS = 10
+
+# ---------------------------------------------------------------------------
+# Conversation summarization
+# ---------------------------------------------------------------------------
+
+MAX_TOTAL_TURNS = 5
+TURNS_TO_KEEP = 2
+INDEX_OF_LAST_SAVED_MESSAGE = -(TURNS_TO_KEEP * 2)
