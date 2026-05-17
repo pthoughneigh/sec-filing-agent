@@ -47,6 +47,14 @@ except Exception as exc:
 # ---------------------------------------------------------------------------
 
 
+def _split_title(chunk: str) -> tuple[str, str]:
+    """Return (title, body) from a chunk, handling missing titles gracefully."""
+    lines = chunk.split("\n", 1)
+    if len(lines) == 2:
+        return lines[0].strip(), lines[1].strip()
+    return "", chunk.strip()
+
+
 def ingest(filename: str) -> bool:
     """Embed and store all chunks from a single text file into ChromaDB.
 
@@ -87,29 +95,38 @@ def ingest(filename: str) -> bool:
         log.error("Could not read '%s': %s", text_path, exc)
         return False
 
-    # FIX 2: Filter out whitespace-only chunks at split time so they are never
-    # embedded or stored. The old `not any(chunks)` check passed as long as a
-    # single non-empty chunk existed, meaning blank chunks could still slip
-    # through into ChromaDB.
+    # Filter out whitespace-only chunks at split time so they are never
+    # embedded or stored.
     chunks: list[str] = [c for c in raw.split("\n\n---\n\n") if c.strip()]
     if not chunks:
         log.warning("'%s' is empty — skipping.", text_path)
         return False
 
+    # Split title from body so it can be stored as metadata for citations.
+    titles_and_bodies = [_split_title(c) for c in chunks]
+
     log.info("Embedding %s (%d chunks) …", filename, len(chunks))
     try:
-        embeddings: list[list[float]] = vo.embed(chunks, model="voyage-3").embeddings
+        embeddings: list[list[float]] = vo.embed(
+            chunks, input_type="document", model="voyage-3"
+        ).embeddings
     except Exception as exc:
         log.error("VoyageAI embedding failed for '%s': %s", filename, exc)
         return False
 
-    # FIX 1: Use Path.stem instead of split(".")[0] so that filenames
-    # containing multiple dots (e.g. 'ionq.10k.pdf') produce the correct stem
-    # ('ionq.10k') rather than just the first segment ('ionq'), which could
-    # cause ID collisions between different filings.
+    # Use Path.stem instead of split(".")[0] so that filenames containing
+    # multiple dots produce the correct stem rather than just the first segment,
+    # which could cause ID collisions between different filings.
     stem = Path(filename).stem
     ids = [f"{stem}_{i}" for i in range(len(chunks))]
-    metadatas = [{"source": source_path, "chunk_index": i} for i in range(len(chunks))]
+    metadatas = [
+        {
+            "source": source_path,
+            "chunk_index": i,
+            "title": title,
+        }
+        for i, (title, _) in enumerate(titles_and_bodies)
+    ]
 
     try:
         collection.add(

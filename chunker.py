@@ -96,14 +96,9 @@ def load_pdf(filename: str) -> bool:
             if buffer:
                 chunks.append(f"{current_title}\n" + "\n".join(buffer))
                 buffer = []
-            # FIX 1: When consecutive titles appear with no body between them,
-            # concatenate rather than silently overwriting the previous title.
-            # Without this, the earlier title is lost entirely because the
-            # `if buffer` guard above skips the flush when buffer is empty.
-            if current_title and not buffer:
-                current_title = f"{current_title} — {element.text}"
-            else:
-                current_title = element.text
+            # Always take the latest title — consecutive titles with no body
+            # between them are pure navigation markers and not worth preserving.
+            current_title = element.text
 
         elif category in _BODY_CATEGORIES:
             buffer.append(element.text)
@@ -111,9 +106,7 @@ def load_pdf(filename: str) -> bool:
             if len("\n".join(buffer)) > _CHUNK_SIZE_THRESHOLD:
                 chunks.append(f"{current_title}\n" + "\n".join(buffer))
                 buffer = []
-                # Reset title after a mid-section flush so the next chunk
-                # doesn't re-use a stale heading from a previous section.
-                current_title = ""
+                # Keep the current title so continuation chunks stay labelled.
 
     # Flush any remaining content
     if buffer:

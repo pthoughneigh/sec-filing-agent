@@ -10,6 +10,7 @@ import ast
 import logging
 import operator
 import sys
+import re
 from pathlib import Path
 
 import anthropic
@@ -17,7 +18,9 @@ from anthropic import APIConnectionError, APIStatusError, APITimeoutError
 from dotenv import load_dotenv
 
 from chunker import load_pdfs
-from config import FILENAMES, HAIKU_INPUT_PRICE_PER_M, HAIKU_OUTPUT_PRICE_PER_M
+from config import (FILENAMES, HAIKU_INPUT_PRICE_PER_M, 
+                   HAIKU_OUTPUT_PRICE_PER_M, SYSTEM_PROMPT, 
+                   CHAT_OUTPUT_FOLDER, TOP_K, N_PARAMETERS)
 from ingest import collection, ingest_all, vo
 
 # ---------------------------------------------------------------------------
@@ -42,6 +45,7 @@ if not Path(".env").exists():
 
 try:
     client = anthropic.Anthropic(timeout=60.0)
+    log.info("Anthropic client initialised successfully.")
 except Exception as exc:
     log.error("Failed to initialise Anthropic client: %s", exc)
     log.error("Make sure ANTHROPIC_API_KEY is set in your .env file.")
@@ -51,11 +55,8 @@ except Exception as exc:
 # Constants
 # ---------------------------------------------------------------------------
 
-# Maximum number of tool-call rounds per agent() invocation.
-# Prevents runaway loops and unbounded API spend.
 MAX_TOOL_TURNS: int = 10
 
-# Allowed AST node types for the safe expression evaluator.
 _SAFE_OPERATORS: dict[type, object] = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -121,11 +122,169 @@ TOOLS: list[dict] = [
     },
 ]
 
-SYSTEM_PROMPT = """You are a stock analysis assistant specialising in SEC filings.
-Use `rag_search` to retrieve evidence from the filings before answering, and
-`calculate` for any arithmetic. If the information is not in the filings, say so.
-Be concise and factual — no filler text."""
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
 
+def _write_to_file(conversation: list[str], file_number: int) -> None:
+    """
+    Write a list of plaintext conversation lines to a numbered chat file.
+
+    Args:
+        conversation: List of formatted strings, each representing one message.
+        file_number: The numeric suffix for the output filename (e.g. 2 → chat_2).
+
+    Raises:
+        OSError: If the file cannot be opened or written to.
+    """
+    filepath = CHAT_OUTPUT_FOLDER / f'chat_{file_number}'
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            for message in conversation:
+                f.write(str(message) + '\n')
+        log.info("Conversation saved to %s", filepath)
+    except OSError as e:
+        log.error("Failed to write conversation to %s: %s", filepath, e)
+        raise
+
+def _save_conversation(conversation: list[dict]) -> None:
+    """
+    Convert a conversation history to plaintext and save it to a numbered file
+    in CHAT_OUTPUT_FOLDER. Tool result messages are excluded from the output.
+    Each run creates a new file with an incremented number (chat_0, chat_1, ...).
+    Does nothing if the conversation is empty.
+
+    Args:
+        conversation: List of message dicts with 'role' and 'content' keys,
+                      in the Anthropic API format.
+
+    Raises:
+        OSError: If the output folder cannot be created or the file cannot be written.
+    """
+    if not conversation:
+        log.debug("Conversation is empty — skipping save.")
+        return
+
+    def get_assistant_text(content: list) -> str:
+        """
+        Extract plain text from an assistant content block list.
+        Handles both raw dicts and Pydantic model objects (e.g. TextBlock).
+        Returns an empty string if no text block is found (e.g. tool-only responses).
+
+        Args:
+            content: List of content blocks from an assistant message.
+
+        Returns:
+            The text of the first text block found, or an empty string.
+        """
+        for block in content:
+            if isinstance(block, dict) and block.get('type') == 'text':
+                return block['text']
+            if hasattr(block, 'text'):
+                return block.text
+        return ''
+
+    try:
+        CHAT_OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.error("Failed to create output folder %s: %s", CHAT_OUTPUT_FOLDER, e)
+        raise
+
+    plain_text: list[str] = [
+        f"{x['role']}: {x['content']}\n" if x['role'] == 'user' and isinstance(x['content'], str)
+        else f"{x['role']}: {get_assistant_text(x['content'])}\n"
+        for x in conversation
+        if not (x['role'] == 'user' and isinstance(x['content'], list))
+        and not (x['role'] == 'assistant' and get_assistant_text(x['content']) == '')
+    ]
+
+    if not plain_text:
+        log.debug("No printable messages after filtering — skipping save.")
+        return
+
+    try:
+        files = sorted(CHAT_OUTPUT_FOLDER.iterdir())
+        chat_files = [f for f in files if f.name.startswith('chat_')]
+
+        if not chat_files:
+            _write_to_file(plain_text, 0)
+        else:
+            match = re.search(r'\d+', chat_files[-1].name)
+            last_file_number = int(match.group()) if match else 0
+            _write_to_file(plain_text, last_file_number + 1)
+
+    except OSError as e:
+        log.error("Failed to read chat folder %s: %s", CHAT_OUTPUT_FOLDER, e)
+        raise
+
+def _check_collection_populated() -> None:
+    """Warn the user if the vector store contains no documents.
+
+    Called once at startup after ingestion so the user knows immediately if
+    something went wrong during chunking/ingestion.
+    """
+    try:
+        count = collection.count()
+        if count == 0:
+            log.warning(
+                "The vector store is empty. Check that your PDFs are in ./documents/ "
+                "and that chunking/ingestion completed without errors."
+            )
+        else:
+            log.info("Vector store ready — %d chunks indexed.", count)
+    except Exception as exc:
+        log.warning("Could not verify collection size: %s", exc)
+
+def _rerank(
+    query: str,
+    docs: list[str],
+    metas: list[dict],
+) -> tuple[list[str], list[dict]]:
+    """Rerank retrieved documents by relevance to the query using VoyageAI.
+
+    Calls the VoyageAI rerank API to score and reorder ``docs`` by their
+    relevance to ``query``, then aligns ``metas`` to the new ordering.
+
+    Args:
+        query: The natural-language question used as the reranking signal.
+        docs: Candidate document chunks to rerank, as returned by ChromaDB.
+        metas: Metadata dicts corresponding 1-to-1 with ``docs``.
+
+    Returns:
+        A tuple ``(reranked_docs, reranked_metas)`` where both lists are
+        ordered from most to least relevant and contain at most ``TOP_K``
+        items.
+
+    Raises:
+        RuntimeError: If the VoyageAI rerank call fails.
+        IndexError: If ``metas`` is shorter than the highest index returned
+            by the reranker (i.e. ``metas`` and ``docs`` are misaligned).
+    """
+    try:
+        rerank_results = vo.rerank(
+            query=query,
+            documents=docs,
+            model="rerank-2",
+            top_k=TOP_K,
+        )
+    except Exception as exc:
+        log.error("VoyageAI rerank failed: %s", exc)
+        raise RuntimeError(f"Rerank call failed — {exc}") from exc
+
+    results_list = rerank_results.results
+
+    try:
+        reranked_docs = [results_list[i].document for i in range(len(results_list))]
+        indexes = [results_list[i].index for i in range(len(results_list))]
+        reranked_metas = [metas[i] for i in indexes]
+    except IndexError as exc:
+        log.error("Metadata alignment error during rerank: %s", exc)
+        raise IndexError(
+            "Metas list is misaligned with reranker indexes — "
+            "ensure docs and metas have the same length."
+        ) from exc
+
+    return reranked_docs, reranked_metas
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
@@ -175,45 +334,60 @@ def calculate(expression: str) -> str:
         The string representation of the result, or a descriptive error message
         the model can relay to the user.
     """
+    log.debug("calculate() called with expression: %r", expression)
     try:
         tree = ast.parse(expression.strip(), mode="eval")
         result = _eval_node(tree)
+        log.debug("calculate() result: %s", result)
         return str(result)
     except ZeroDivisionError:
+        log.warning("calculate() — division by zero in expression: %r", expression)
         return "Error: division by zero."
     except SyntaxError as exc:
+        log.warning("calculate() — syntax error in expression %r: %s", expression, exc)
         return f"Error: invalid expression syntax — {exc}"
     except ValueError as exc:
+        log.warning("calculate() — value error: %s", exc)
         return f"Error: {exc}"
     except Exception as exc:
+        log.error("calculate() — unexpected error: %s", exc)
         return f"Error: could not evaluate expression — {exc}"
 
 
-def rag_search(query: str, n_results: int = 2) -> str:
-    """Query the ChromaDB vector store and return formatted context chunks.
+def rag_search(query: str, n_results: int = N_PARAMETERS) -> str:
+    """Query the ChromaDB vector store, rerank results, and return formatted context chunks.
+
+    Embeds ``query`` via VoyageAI, retrieves the ``n_results`` nearest
+    neighbours from ChromaDB, reranks them with the VoyageAI rerank API,
+    and returns the top-``TOP_K`` passages as a single formatted string.
 
     Args:
         query: Natural-language question to embed and search.
-        n_results: Number of nearest-neighbour chunks to return.
+        n_results: Number of nearest-neighbour chunks to retrieve before
+            reranking. The final output contains at most ``TOP_K`` chunks.
 
     Returns:
         A newline-joined string of context passages each prefixed with source
-        metadata, or a descriptive error / warning string.
+        metadata, or a descriptive error / warning string if any step fails.
+
+    Raises:
+        Does not propagate exceptions — all errors are caught, logged, and
+        returned as descriptive strings so the caller always receives a ``str``.
     """
+    log.info("rag_search() called — query: %r | n_results: %d", query, n_results)
     try:
-        embeddings = vo.embed([query], model="voyage-3").embeddings
+        embeddings = vo.embed([query], input_type='query', model="voyage-3").embeddings
     except Exception as exc:
         log.error("VoyageAI embed failed: %s", exc)
         return f"Error: could not embed query — {exc}"
 
-    # FIX 4: Clamp n_results to the actual collection size to avoid a
-    # ChromaDB exception when the requested count exceeds available chunks.
     try:
         n_results = min(n_results, collection.count())
     except Exception as exc:
         log.warning("Could not determine collection size: %s", exc)
 
     if n_results == 0:
+        log.warning("rag_search() — collection is empty, no results returned.")
         return "No relevant passages found in the filings for this query."
 
     try:
@@ -229,12 +403,23 @@ def rag_search(query: str, n_results: int = 2) -> str:
     metadatas: list[dict] = results["metadatas"][0]
 
     if not documents:
+        log.warning("rag_search() — query returned no documents.")
         return "No relevant passages found in the filings for this query."
 
-    context_docs = [
-        f"[source: {m['source']}, chunk_index: {m['chunk_index']}]\n{d}"
-        for d, m in zip(documents, metadatas)
-    ]
+    try:
+        doc, metas = _rerank(query, documents, metadatas)
+    except (RuntimeError, IndexError) as exc:
+        log.error("Rerank step failed: %s", exc)
+        return f"Error: reranking failed — {exc}"
+
+    context_docs = []
+    for d, m in zip(doc, metas):
+        log.debug("Retrieved chunk %d from %s", m['chunk_index'], m['source'])
+        context_docs.append(
+            f"[source: {m['source']}, section: {m.get('title', 'unknown')}]\n{d}"
+        )
+
+    log.info("rag_search() — returned %d chunks.", len(context_docs))
     return "\n".join(context_docs)
 
 
@@ -249,11 +434,12 @@ def run_tool(name: str, inputs: dict) -> str:
         String result from the corresponding tool, or an error message if the
         tool name is not recognised.
     """
-    log.debug("Tool call: %s | inputs: %s", name, inputs)
+    log.info("run_tool() dispatching — tool: %r | inputs: %s", name, inputs)
     if name == "calculate":
         return calculate(inputs["expression"])
     if name == "rag_search":
         return rag_search(inputs["query"], int(inputs.get("n_results", 2)))
+    log.warning("run_tool() — unknown tool name: %r", name)
     return f"Error: unknown tool {name!r} — no action taken."
 
 
@@ -282,6 +468,8 @@ def agent(messages: list[dict]) -> tuple[str, int, int]:
     total_output = 0
     tool_turns = 0
 
+    log.debug("agent() started — %d messages in history.", len(messages))
+
     while True:
         if tool_turns >= MAX_TOOL_TURNS:
             log.warning("Reached MAX_TOOL_TURNS (%d) — breaking loop.", MAX_TOOL_TURNS)
@@ -296,11 +484,18 @@ def agent(messages: list[dict]) -> tuple[str, int, int]:
             response = client.messages.create(
                 model="claude-haiku-4-5",
                 max_tokens=1024,
-                system=SYSTEM_PROMPT,
+                system=[
+                    {
+                        'type': 'text',
+                        "text": SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ],
                 tools=TOOLS,
                 messages=messages,
             )
         except APITimeoutError:
+            log.error("API request timed out after 60s.")
             return (
                 "[error] Request timed out after 60 s. "
                 "Try a shorter question or check your connection.",
@@ -309,20 +504,23 @@ def agent(messages: list[dict]) -> tuple[str, int, int]:
             )
         except APIStatusError as exc:
             if exc.status_code == 401:
-                log.error("Invalid Anthropic API key. Check your .env file.")
+                log.error("Invalid Anthropic API key — check your .env file.")
                 sys.exit(1)
             if exc.status_code == 429:
+                log.warning("Rate limit hit (429).")
                 return (
                     "[error] Rate limit reached. Wait a moment and try again.",
                     total_input,
                     total_output,
                 )
+            log.error("Anthropic API error %d: %s", exc.status_code, exc.message)
             return (
                 f"[error] Anthropic API error {exc.status_code}: {exc.message}",
                 total_input,
                 total_output,
             )
         except APIConnectionError as exc:
+            log.error("Could not reach the Anthropic API: %s", exc)
             return (
                 f"[error] Could not reach the Anthropic API: {exc}",
                 total_input,
@@ -339,18 +537,18 @@ def agent(messages: list[dict]) -> tuple[str, int, int]:
         )
 
         if response.stop_reason == "end_turn":
-            # FIX 2: Find the first text block explicitly rather than blindly
-            # taking [0], which may be a non-text block and would crash or
-            # return the wrong content.
             text_block = next(
                 (b for b in response.content if b.type == "text"), None
             )
             if text_block is None:
+                log.warning("end_turn reached but no text block found in response.")
                 return "(No text response generated)", total_input, total_output
+            log.debug("agent() finished after %d tool turn(s).", tool_turns)
             return text_block.text, total_input, total_output
 
         if response.stop_reason == "tool_use":
             tool_turns += 1
+            log.info("Tool use requested — turn %d/%d.", tool_turns, MAX_TOOL_TURNS)
             messages.append({"role": "assistant", "content": response.content})
 
             tool_results = []
@@ -374,30 +572,6 @@ def agent(messages: list[dict]) -> tuple[str, int, int]:
 
 
 # ---------------------------------------------------------------------------
-# Startup validation
-# ---------------------------------------------------------------------------
-
-
-def _check_collection_populated() -> None:
-    """Warn the user if the vector store contains no documents.
-
-    Called once at startup after ingestion so the user knows immediately if
-    something went wrong during chunking/ingestion.
-    """
-    try:
-        count = collection.count()
-        if count == 0:
-            log.warning(
-                "The vector store is empty. Check that your PDFs are in ./documents/ "
-                "and that chunking/ingestion completed without errors."
-            )
-        else:
-            log.info("Vector store ready — %d chunks indexed.", count)
-    except Exception as exc:
-        log.warning("Could not verify collection size: %s", exc)
-
-
-# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -416,18 +590,23 @@ def cli() -> None:
     total_input_tokens = 0
     total_output_tokens = 0
 
+    log.info("Stock Agent CLI started.")
     print("Stock Agent started. Commands: 'quit' to exit, 'clear' to reset.\n")
 
     while True:
         try:
             user_input = input("you: ").strip()
         except (KeyboardInterrupt, EOFError):
+            log.info("Session interrupted by user.")
             print("\nExiting.")
             break
 
         if user_input.upper() == "QUIT":
+            log.info("User issued QUIT — saving conversation.")
+            _save_conversation(conversation)
             break
         if user_input.upper() == "CLEAR":
+            log.info("User issued CLEAR — resetting conversation history.")
             conversation.clear()
             print("Conversation cleared.\n")
             continue
@@ -435,28 +614,19 @@ def cli() -> None:
             continue
 
         conversation.append({"role": "user", "content": user_input})
-
-        # Snapshot the length AFTER appending the user message so that
-        # del conversation[snapshot:] on error rolls back the user message
-        # AND any intermediate tool-use turns agent() appended.
-        # FIX 1: previously used pop() which only removed one item, leaving
-        # tool-use turns in the history on error.
         snapshot = len(conversation)
 
         answer, input_tokens, output_tokens = agent(conversation)
         total_input_tokens += input_tokens
         total_output_tokens += output_tokens
 
+        log.debug("Turn tokens — input: %d | output: %d", input_tokens, output_tokens)
         print(f"claude: {answer}\n")
 
         if answer.startswith("[error]"):
-            # Roll back the user message AND any intermediate tool-use messages
-            # that agent() appended to the conversation during tool-call rounds.
+            log.warning("Error response received — rolling back conversation to snapshot %d.", snapshot)
             del conversation[snapshot:]
         else:
-            # FIX 3: Use a structured content list rather than a bare string to
-            # keep the conversation history format consistent with tool-use turns
-            # and avoid API errors on subsequent multi-turn requests.
             conversation.append(
                 {
                     "role": "assistant",
@@ -466,6 +636,13 @@ def cli() -> None:
 
     input_cost = (total_input_tokens / 1_000_000) * HAIKU_INPUT_PRICE_PER_M
     output_cost = (total_output_tokens / 1_000_000) * HAIKU_OUTPUT_PRICE_PER_M
+
+    log.info(
+        "Session ended — input tokens: %d | output tokens: %d | estimated cost: $%.6f",
+        total_input_tokens,
+        total_output_tokens,
+        input_cost + output_cost,
+    )
 
     print("\n--- Session summary ---")
     print(f"Input tokens : {total_input_tokens:,}")
