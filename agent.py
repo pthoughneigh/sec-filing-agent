@@ -21,7 +21,9 @@ from chunker import load_pdfs
 from config import (FILENAMES, HAIKU_INPUT_PRICE_PER_M, 
                    HAIKU_OUTPUT_PRICE_PER_M, SYSTEM_PROMPT, 
                    CHAT_OUTPUT_FOLDER, TOP_K, N_PARAMETERS, 
-                   MAX_TOTAL_TURNS, INDEX_OF_LAST_SAVED_MESSAGE)
+                   MAX_TOTAL_TURNS, INDEX_OF_LAST_SAVED_MESSAGE,
+                   MAX_TOOL_TURNS)
+
 from ingest import collection, ingest_all, vo
 
 # ---------------------------------------------------------------------------
@@ -56,8 +58,6 @@ except Exception as exc:
 # Constants
 # ---------------------------------------------------------------------------
 
-MAX_TOOL_TURNS: int = 10
-
 _SAFE_OPERATORS: dict[type, object] = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -69,6 +69,12 @@ _SAFE_OPERATORS: dict[type, object] = {
     ast.USub: operator.neg,
     ast.UAdd: operator.pos,
 }
+
+# ---------------------------------------------------------------------------
+# Variables
+# ---------------------------------------------------------------------------
+FILENAME_CACHE = []
+
 
 TOOLS: list[dict] = [
     {
@@ -113,19 +119,90 @@ TOOLS: list[dict] = [
                 "n_results": {
                     "type": "number",
                     "description": (
-                        "How many document chunks to retrieve. Defaults to 2. "
+                        "How many document chunks to retrieve. Defaults to 2."
                         "Increase to 4-5 for broad questions."
                     ),
                 },
+                "filename_filter": {
+                    "type": "string",
+                    "description": (
+                        "Which files to look at for retrieving results. Default is None."
+                    )
+                }
             },
             "required": ["query"],
         },
     },
+    {
+        "name": "list_ingested_files",
+        "description": ("Tool used to return a list of used sources for chunking and ingestion. "
+                        "Use this whenever user needs the datasources used for ingestion in to the database."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        },
+
+    }
+     
 ]
 
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
+
+def _get_source_filenames() -> set[str]:
+    """
+    Retrieve all unique source filenames from ChromaDB metadata.
+
+    Queries the entire collection, extracts the 'source' field from each
+    chunk's metadata, and returns a deduplicated set of filenames.
+    Used internally to build the filename cache.
+
+    Returns:
+        set[str]: Unique source filenames (e.g. {'oklo_10k.pdf', 'oklo_8k.pdf'}).
+                  Returns an empty set if the collection is empty or an error occurs.
+    """
+    try:
+        results = collection.get()
+        if not results['metadatas']:
+            log.error("Collection is empty.")
+            return set()
+    except Exception as exc:
+        log.error("Failed to retrieve source files: %s", exc)
+        return set()
+
+    sources = set()
+    for metadata in results['metadatas']:
+        source = metadata.get('source')
+        if not source:
+            log.warning("Chunk missing 'source' field, skipping: %s", metadata)
+            continue
+        try:
+            sources.add(source.split('/')[2])
+        except IndexError:
+            log.warning("Unexpected source path format, skipping: %s", source)
+            continue
+
+    return sources
+
+def _build_filename_cache() -> None:
+    """
+    Populate the global FILENAME_CACHE with available source filenames.
+
+    Calls _get_source_filenames() and stores the result in FILENAME_CACHE
+    as a list. Should be called once at startup before any tool that
+    depends on the cache is invoked.
+
+    Returns:
+        None. Logs an error and returns early if no sources are found.
+    """
+    global FILENAME_CACHE
+    sources = _get_source_filenames()
+    if not sources:
+        return
+    FILENAME_CACHE = list(sources)
 
 def _write_to_file(conversation: list[str], file_number: int) -> None:
     """
@@ -428,7 +505,33 @@ def calculate(expression: str) -> str:
         return f"Error: could not evaluate expression — {exc}"
 
 
-def rag_search(query: str, n_results: int = N_PARAMETERS) -> str:
+def list_ingested_files() -> str:
+    """
+    Query ChromaDB for all ingested document sources and return a formatted list.
+
+    Retrieves metadata from the entire collection, extracts the 'source' field
+    from each chunk, deduplicates by filename, and returns a numbered list
+    as a string for Claude to read.
+
+    Returns:
+        str: A formatted string listing all unique source filenames,
+             e.g. "This is the list of used sources:\n1. oklo_10k.pdf\n2. ..."
+    """
+    log.info("list_ingested_files() called")
+
+    sources = _get_source_filenames()
+
+    if not sources:
+        return "Error: could not retrieve source files"
+    
+    message = "This is the list of used sources:"
+    for i, source in enumerate(sources):
+        message += f'\n{i+1}. {source}'
+
+    return message
+
+
+def rag_search(query: str, n_results: int = N_PARAMETERS, filename_filter: str | None = None) -> str:
     """Query the ChromaDB vector store, rerank results, and return formatted context chunks.
 
     Embeds ``query`` via VoyageAI, retrieves the ``n_results`` nearest
@@ -439,6 +542,7 @@ def rag_search(query: str, n_results: int = N_PARAMETERS) -> str:
         query: Natural-language question to embed and search.
         n_results: Number of nearest-neighbour chunks to retrieve before
             reranking. The final output contains at most ``TOP_K`` chunks.
+        filename_filter: Name of a file for filtering the database search.
 
     Returns:
         A newline-joined string of context passages each prefixed with source
@@ -465,9 +569,24 @@ def rag_search(query: str, n_results: int = N_PARAMETERS) -> str:
         return "No relevant passages found in the filings for this query."
 
     try:
+        query_kwargs = {
+            "query_embeddings": embeddings,
+            "n_results": n_results,
+        }
+        if filename_filter:
+            filename_filter = filename_filter.lower()+'.pdf' if not filename_filter.endswith('.pdf') else filename_filter
+            source = ""
+            for file in FILENAME_CACHE:
+                if file.lower() == filename_filter.lower():
+                    source = f"./documents/{file}"
+            if not source:
+                log.warning("rag_search() — filename_filter %r did not match any ingested file.", filename_filter)
+                return f"No file matching '{filename_filter}' found in the database. Use list_ingested_files to see available sources."
+            log.info("rag_search() — filtering by source: %s", filename_filter)
+            query_kwargs["where"] = {"source": source}
+            
         results = collection.query(
-            query_embeddings=embeddings,
-            n_results=n_results,
+            **query_kwargs
         )
     except Exception as exc:
         log.error("ChromaDB query failed: %s", exc)
@@ -501,7 +620,7 @@ def run_tool(name: str, inputs: dict) -> str:
     """Dispatch a tool call by name and return its string result.
 
     Args:
-        name: The tool name ('calculate' or 'rag_search').
+        name: The tool name ('calculate', 'rag_search' or 'list_ingested_files').
         inputs: The tool input dict provided by the model.
 
     Returns:
@@ -512,7 +631,9 @@ def run_tool(name: str, inputs: dict) -> str:
     if name == "calculate":
         return calculate(inputs["expression"])
     if name == "rag_search":
-        return rag_search(inputs["query"], int(inputs.get("n_results", 2)))
+        return rag_search(inputs["query"], int(inputs.get("n_results", N_PARAMETERS)), inputs.get('filename_filter', None))
+    if name == 'list_ingested_files':
+        return list_ingested_files()
     log.warning("run_tool() — unknown tool name: %r", name)
     return f"Error: unknown tool {name!r} — no action taken."
 
@@ -555,7 +676,7 @@ def agent(messages: list[dict]) -> tuple[str, int, int]:
             )
 
         try:
-            response = client.messages.create(
+            with client.messages.stream(
                 model="claude-haiku-4-5",
                 max_tokens=4096,
                 system=[
@@ -567,7 +688,19 @@ def agent(messages: list[dict]) -> tuple[str, int, int]:
                 ],
                 tools=TOOLS,
                 messages=messages,
-            )
+            ) as stream:
+                printed_prefix = False
+                for event in stream:
+                    if event.type == "text":
+                        if not printed_prefix:
+                             print("assistant: ", end="") 
+                             printed_prefix = True
+                        print(event.text, end="", flush=True)
+                    elif event.type == "message_stop":
+                        response = stream.get_final_message()
+                        if printed_prefix:
+                            print()
+
         except APITimeoutError:
             log.error("API request timed out after 60s.")
             return (
@@ -697,10 +830,10 @@ def cli() -> None:
         total_output_tokens += output_tokens
 
         log.debug("Turn tokens — input: %d | output: %d", input_tokens, output_tokens)
-        print(f"assistant: {answer}\n")
 
         if answer.startswith("[error]"):
             log.warning("Error response received — rolling back conversation to snapshot %d.", snapshot)
+            print(f"assistant: {answer}")
             del conversation[snapshot:]
         else:
             # Removes tool_use response from conversation
@@ -736,4 +869,5 @@ if __name__ == "__main__":
     load_pdfs(FILENAMES)
     ingest_all(FILENAMES)
     _check_collection_populated()
+    _build_filename_cache()
     cli()

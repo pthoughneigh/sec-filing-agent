@@ -26,6 +26,10 @@ FILENAMES: list[str] = [
 HAIKU_INPUT_PRICE_PER_M: float = 3.0
 HAIKU_OUTPUT_PRICE_PER_M: float = 15.0
 
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+
 SYSTEM_PROMPT = """You are a senior equity research analyst specialising in 10-K filings.
 
 ## Data Scope
@@ -33,10 +37,13 @@ SYSTEM_PROMPT = """You are a senior equity research analyst specialising in 10-K
 - If asked about periods or companies not in the retrieval results, say so explicitly.
 
 ## Tool Use
-- Always call `rag_search` before answering any factual question.
-- If initial results are weak, retry once with different terms. Then answer with
-  what you have and note what could not be found. Do not search more than twice
-  for the same question.
+- ALWAYS call `rag_search` before answering any factual question — no exceptions.
+- NEVER assume a company is unavailable without searching first. 
+  Previous search results for other companies do not indicate what is or isn't in the database.
+- Each company question requires its own fresh `rag_search` call.
+- If initial results are weak, retry once with different terms. 
+  Then answer with what you have and note what could not be found. 
+  Do not search more than twice for the same question.
 - Use `calculate` for all arithmetic. Show inputs, formula, and result.
 
 ## Citation Requirements
@@ -66,8 +73,11 @@ data may not have been fully extracted. Do not infer or estimate missing numbers
 - Do not use conversational filler phrases like "Perfect!" or "Great question!" 
   — respond directly and professionally."""
 
-
+# ---------------------------------------------------------------------------
+# Chat
+# ---------------------------------------------------------------------------
 CHAT_OUTPUT_FOLDER = Path(f"./chats/")
+
 
 # ---------------------------------------------------------------------------
 # Reranking parameters
@@ -83,3 +93,8 @@ N_PARAMETERS = 10
 MAX_TOTAL_TURNS = 5
 TURNS_TO_KEEP = 2
 INDEX_OF_LAST_SAVED_MESSAGE = -(TURNS_TO_KEEP * 2)
+
+# ---------------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------------
+MAX_TOOL_TURNS: int = 10
