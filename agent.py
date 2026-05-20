@@ -73,7 +73,7 @@ _SAFE_OPERATORS: dict[type, object] = {
 # ---------------------------------------------------------------------------
 # Variables
 # ---------------------------------------------------------------------------
-FILENAME_CACHE = []
+FILENAME_CACHE: list[str] = []
 
 
 TOOLS: list[dict] = [
@@ -117,16 +117,17 @@ TOOLS: list[dict] = [
                     ),
                 },
                 "n_results": {
-                    "type": "number",
+                    "type": "integer",
                     "description": (
-                        "How many document chunks to retrieve. Defaults to 2."
-                        "Increase to 4-5 for broad questions."
+                        "How many document chunks to retrieve before reranking. Defaults to 15. "
+                        "Increase for broad questions."
                     ),
                 },
                 "filename_filter": {
                     "type": "string",
                     "description": (
-                        "Which files to look at for retrieving results. Default is None."
+                        "Filename to restrict the search to a single filing, e.g. 'ionq.pdf'. "
+                        "Use list_ingested_files to see valid filenames. Omit to search all filings."
                     )
                 }
             },
@@ -135,8 +136,9 @@ TOOLS: list[dict] = [
     },
     {
         "name": "list_ingested_files",
-        "description": ("Tool used to return a list of used sources for chunking and ingestion. "
-                        "Use this whenever user needs the datasources used for ingestion in to the database."
+        "description": (
+            "Tool used to return a list of used sources for chunking and ingestion."
+            "Returns a numbered list of all filenames currently stored in the vector database."
         ),
         "input_schema": {
             "type": "object",
@@ -144,8 +146,36 @@ TOOLS: list[dict] = [
             "required": []
         },
 
+    },
+    {
+        "name": "compare_companies",
+        "description": (
+            "Retrieves the information about the each company mentioned in query for company comparison."
+            "Use this tool when user wants to compare 2 or more companies, e.g. 'Compare me company X with Company Y' "
+            "or 'Give me the difference between companies X, Y, Z'"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                'query': {
+                    "type": "string",
+                    "description": (
+                        "The natural-language question to search for, "
+                        "e.g. 'Compare me company X with company Y.' or 'What is the difference between company X, Y and Z?'" 
+                    )
+                },
+                'filenames': {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": ("Array of strings - filenames relevant to the query, used for comparison e.g. ['companyX.pdf', 'companyY.pdf']")
+                }
+
+            },
+            "required": ['query', 'filenames']
+        }
     }
-     
 ]
 
 # ---------------------------------------------------------------------------
@@ -201,6 +231,7 @@ def _build_filename_cache() -> None:
     global FILENAME_CACHE
     sources = _get_source_filenames()
     if not sources:
+        log.warning("No source filenames found in the vector store — FILENAME_CACHE will be empty.")
         return
     FILENAME_CACHE = list(sources)
 
@@ -429,10 +460,10 @@ def _summarize_conversation(
     try:
         conversation.insert(0, {"role": "user", "content": f"Summary of previous conversation: {response.content[0].text}"})
     except IndexError as e:
-        log.error(f"Response content is empty: {e}")
+        log.error("Response content is empty: %s", e)
         return original
 
-    log.info("Summarization succeded.")
+    log.info("Summarization succeeded.")
     return conversation
 
 
@@ -615,12 +646,41 @@ def rag_search(query: str, n_results: int = N_PARAMETERS, filename_filter: str |
     log.info("rag_search() — returned %d chunks.", len(context_docs))
     return "\n".join(context_docs)
 
+def compare_companies(query: str, filenames: list[str]) -> str:
+    """Run a RAG search query against multiple files and aggregate the results.
+
+    Args:
+        query: The search query to run against each file.
+        filenames: A list of filenames to search through individually.
+
+    Returns:
+        A single string with each file's results separated by a header and blank lines.
+
+    Raises:
+        ValueError: If query is empty or filenames list is empty.
+    """
+    if not query or not query.strip():
+        raise ValueError("query must be a non-empty string.")
+    if not filenames:
+        raise ValueError("filenames list must not be empty.")
+
+    final_result = []
+    for filename in filenames:
+        if not filename or not filename.strip():
+            log.warning("Skipping empty filename entry in filenames list.")
+            continue
+        result = rag_search(query, filename_filter=filename)
+        result = f"=== Results for {filename} ===\n" + result + "\n"
+        final_result.append(result)
+
+    log.info("compare_companies: finished searching %d file(s) for query %r.", len(final_result), query)
+    return "\n\n".join(final_result)
 
 def run_tool(name: str, inputs: dict) -> str:
     """Dispatch a tool call by name and return its string result.
 
     Args:
-        name: The tool name ('calculate', 'rag_search' or 'list_ingested_files').
+        name: The tool name ('calculate', 'rag_search', 'list_ingested_files' or 'compare_companies').
         inputs: The tool input dict provided by the model.
 
     Returns:
@@ -634,6 +694,8 @@ def run_tool(name: str, inputs: dict) -> str:
         return rag_search(inputs["query"], int(inputs.get("n_results", N_PARAMETERS)), inputs.get('filename_filter', None))
     if name == 'list_ingested_files':
         return list_ingested_files()
+    if name == 'compare_companies':
+        return compare_companies(inputs['query'], filenames=inputs['filenames'])
     log.warning("run_tool() — unknown tool name: %r", name)
     return f"Error: unknown tool {name!r} — no action taken."
 

@@ -31,7 +31,7 @@ try:
 except Exception as exc:
     log.error("Could not initialise VoyageAI client: %s", exc)
     log.error("Make sure VOYAGE_API_KEY is set in your .env file.")
-    sys.exit(1)
+    sys.exit(1) # Fatal — agent cannot function without the embedding client.
 
 try:
     _chroma_client = chromadb.PersistentClient(path="./chroma_db")
@@ -39,7 +39,7 @@ try:
 except Exception as exc:
     log.error("Could not open ChromaDB at ./chroma_db: %s", exc)
     log.error("If the database is corrupted, delete the chroma_db/ folder and re-run.")
-    sys.exit(1)
+    sys.exit(1) # Fatal — agent cannot function without the database.
 
 
 # ---------------------------------------------------------------------------

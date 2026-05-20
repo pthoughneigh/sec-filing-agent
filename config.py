@@ -16,7 +16,7 @@ from pathlib import Path
 FILENAMES: list[str] = [
     "ionq.pdf",
     "rklb.pdf",
-    "oklo.pdf",
+    "oklo.pdf"
 ]
 
 # ---------------------------------------------------------------------------
@@ -83,8 +83,8 @@ CHAT_OUTPUT_FOLDER = Path(f"./chats/")
 # Reranking parameters
 # ---------------------------------------------------------------------------
 
-TOP_K = 3
-N_PARAMETERS = 10
+TOP_K = 5
+N_PARAMETERS = 15
 
 # ---------------------------------------------------------------------------
 # Conversation summarization

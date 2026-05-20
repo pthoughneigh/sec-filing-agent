@@ -34,7 +34,8 @@ def load_pdfs(filenames: list[str]) -> None:
                    ./documents/.
     """
     for filename in filenames:
-        load_pdf(filename)
+        if not load_pdf(filename):
+            log.warning("Skipping '%s' — load_pdf reported failure.", filename)
 
 
 def load_pdf(filename: str) -> bool:
@@ -71,7 +72,7 @@ def load_pdf(filename: str) -> bool:
     try:
         elements = partition_pdf(
             str(pdf_path),
-            strategy="fast",
+            strategy="hi_res",
             languages=["eng"],
         )
     except Exception as exc:
@@ -100,6 +101,12 @@ def load_pdf(filename: str) -> bool:
             # between them are pure navigation markers and not worth preserving.
             current_title = element.text
 
+        elif category == "Table":
+            if buffer:
+                chunks.append(f"{current_title}\n" + "\n".join(buffer))
+                buffer = []
+            chunks.append(f"{current_title}\n" + element.text)
+            
         elif category in _BODY_CATEGORIES:
             buffer.append(element.text)
             # Flush when the buffer grows large enough
@@ -107,7 +114,7 @@ def load_pdf(filename: str) -> bool:
                 chunks.append(f"{current_title}\n" + "\n".join(buffer))
                 buffer = []
                 # Keep the current title so continuation chunks stay labelled.
-
+        
     # Flush any remaining content
     if buffer:
         chunks.append(f"{current_title}\n" + "\n".join(buffer))
