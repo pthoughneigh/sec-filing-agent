@@ -2,10 +2,10 @@
 ingest.py
 
 Embeds pre-chunked text files and upserts them into a ChromaDB persistent
-vector store. Uses VoyageAI's voyage-3 model for embeddings.
+vector store. Uses all-mpnet-base-v2 model for embeddings.
 
-Shared module-level objects (`collection`, `vo`) are imported by agent.py so
-that the same client and collection are reused at query time.
+Shared module-level objects (`collection`, `model`) are imported by agent.py so
+that the same model and collection are reused at query time.
 """
 
 import logging
@@ -13,25 +13,20 @@ import sys
 from pathlib import Path
 
 import chromadb
-import voyageai
-from dotenv import load_dotenv
+from sentence_transformers import SentenceTransformer
 
 from config import FILENAMES
-
 log = logging.getLogger("ingest")
-
-load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Shared clients — imported by agent.py
 # ---------------------------------------------------------------------------
 
 try:
-    vo = voyageai.Client()
+    model = SentenceTransformer('all-mpnet-base-v2')
 except Exception as exc:
-    log.error("Could not initialise VoyageAI client: %s", exc)
-    log.error("Make sure VOYAGE_API_KEY is set in your .env file.")
-    sys.exit(1) # Fatal — agent cannot function without the embedding client.
+    log.error("Could not load embedding model: %s", exc)
+    sys.exit(1) # Fatal — agent cannot function without the embedding model.
 
 try:
     _chroma_client = chromadb.PersistentClient(path="./chroma_db")
@@ -107,11 +102,9 @@ def ingest(filename: str) -> bool:
 
     log.info("Embedding %s (%d chunks) …", filename, len(chunks))
     try:
-        embeddings: list[list[float]] = vo.embed(
-            chunks, input_type="document", model="voyage-3"
-        ).embeddings
+        embeddings: list[list[float]] = model.encode(chunks).tolist()
     except Exception as exc:
-        log.error("VoyageAI embedding failed for '%s': %s", filename, exc)
+        log.error("Embedding failed for '%s': %s", filename, exc)
         return False
 
     # Use Path.stem instead of split(".")[0] so that filenames containing

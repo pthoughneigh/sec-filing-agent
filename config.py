@@ -80,19 +80,18 @@ CHAT_OUTPUT_FOLDER = Path(f"./chats/")
 
 
 # ---------------------------------------------------------------------------
-# Reranking parameters
+# Retrieval parameters 
 # ---------------------------------------------------------------------------
 
-TOP_K = 5
-N_PARAMETERS = 15
+N_PARAMETERS = 5
 
 # ---------------------------------------------------------------------------
 # Conversation summarization
 # ---------------------------------------------------------------------------
 
-MAX_TOTAL_TURNS = 5
-TURNS_TO_KEEP = 2
-INDEX_OF_LAST_SAVED_MESSAGE = -(TURNS_TO_KEEP * 2)
+MAX_TOTAL_TURNS: int = 5
+TURNS_TO_KEEP: int = 2
+INDEX_OF_LAST_SAVED_MESSAGE: int = -(TURNS_TO_KEEP * 2)
 
 # ---------------------------------------------------------------------------
 # Agent

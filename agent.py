@@ -20,11 +20,11 @@ from dotenv import load_dotenv
 from chunker import load_pdfs
 from config import (FILENAMES, HAIKU_INPUT_PRICE_PER_M, 
                    HAIKU_OUTPUT_PRICE_PER_M, SYSTEM_PROMPT, 
-                   CHAT_OUTPUT_FOLDER, TOP_K, N_PARAMETERS, 
+                   CHAT_OUTPUT_FOLDER, N_PARAMETERS, 
                    MAX_TOTAL_TURNS, INDEX_OF_LAST_SAVED_MESSAGE,
                    MAX_TOOL_TURNS)
 
-from ingest import collection, ingest_all, vo
+from ingest import collection, ingest_all, model
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -344,56 +344,6 @@ def _check_collection_populated() -> None:
     except Exception as exc:
         log.warning("Could not verify collection size: %s", exc)
 
-def _rerank(
-    query: str,
-    docs: list[str],
-    metas: list[dict],
-) -> tuple[list[str], list[dict]]:
-    """Rerank retrieved documents by relevance to the query using VoyageAI.
-
-    Calls the VoyageAI rerank API to score and reorder ``docs`` by their
-    relevance to ``query``, then aligns ``metas`` to the new ordering.
-
-    Args:
-        query: The natural-language question used as the reranking signal.
-        docs: Candidate document chunks to rerank, as returned by ChromaDB.
-        metas: Metadata dicts corresponding 1-to-1 with ``docs``.
-
-    Returns:
-        A tuple ``(reranked_docs, reranked_metas)`` where both lists are
-        ordered from most to least relevant and contain at most ``TOP_K``
-        items.
-
-    Raises:
-        RuntimeError: If the VoyageAI rerank call fails.
-        IndexError: If ``metas`` is shorter than the highest index returned
-            by the reranker (i.e. ``metas`` and ``docs`` are misaligned).
-    """
-    try:
-        rerank_results = vo.rerank(
-            query=query,
-            documents=docs,
-            model="rerank-2",
-            top_k=TOP_K,
-        )
-    except Exception as exc:
-        log.error("VoyageAI rerank failed: %s", exc)
-        raise RuntimeError(f"Rerank call failed — {exc}") from exc
-
-    results_list = rerank_results.results
-
-    try:
-        reranked_docs = [results_list[i].document for i in range(len(results_list))]
-        indexes = [results_list[i].index for i in range(len(results_list))]
-        reranked_metas = [metas[i] for i in indexes]
-    except IndexError as exc:
-        log.error("Metadata alignment error during rerank: %s", exc)
-        raise IndexError(
-            "Metas list is misaligned with reranker indexes — "
-            "ensure docs and metas have the same length."
-        ) from exc
-
-    return reranked_docs, reranked_metas
 
 def _summarize_conversation(
         conversation: list[dict]
@@ -563,16 +513,15 @@ def list_ingested_files() -> str:
 
 
 def rag_search(query: str, n_results: int = N_PARAMETERS, filename_filter: str | None = None) -> str:
-    """Query the ChromaDB vector store, rerank results, and return formatted context chunks.
+    """Query the ChromaDB vector store and return formatted context chunks.
 
-    Embeds ``query`` via VoyageAI, retrieves the ``n_results`` nearest
-    neighbours from ChromaDB, reranks them with the VoyageAI rerank API,
-    and returns the top-``TOP_K`` passages as a single formatted string.
+    Embeds ``query`` via all-mpnet-base-v2 model, retrieves the ``n_results`` nearest
+    neighbours from ChromaDB, and returns the top-``TOP_K`` passages as a single formatted string.
 
     Args:
         query: Natural-language question to embed and search.
-        n_results: Number of nearest-neighbour chunks to retrieve before
-            reranking. The final output contains at most ``TOP_K`` chunks.
+        n_results: Number of nearest-neighbour chunks to retrieve. 
+        The final output contains at most ``TOP_K`` chunks.
         filename_filter: Name of a file for filtering the database search.
 
     Returns:
@@ -585,9 +534,9 @@ def rag_search(query: str, n_results: int = N_PARAMETERS, filename_filter: str |
     """
     log.info("rag_search() called — query: %r | n_results: %d", query, n_results)
     try:
-        embeddings = vo.embed([query], input_type='query', model="voyage-3").embeddings
+        embeddings = model.encode([query]).tolist()
     except Exception as exc:
-        log.error("VoyageAI embed failed: %s", exc)
+        log.error("Model embed failed: %s", exc)
         return f"Error: could not embed query — {exc}"
 
     try:
@@ -630,14 +579,8 @@ def rag_search(query: str, n_results: int = N_PARAMETERS, filename_filter: str |
         log.warning("rag_search() — query returned no documents.")
         return "No relevant passages found in the filings for this query."
 
-    try:
-        doc, metas = _rerank(query, documents, metadatas)
-    except (RuntimeError, IndexError) as exc:
-        log.error("Rerank step failed: %s", exc)
-        return f"Error: reranking failed — {exc}"
-
     context_docs = []
-    for d, m in zip(doc, metas):
+    for d, m in zip(documents, metadatas):
         log.debug("Retrieved chunk %d from %s", m['chunk_index'], m['source'])
         context_docs.append(
             f"[source: {m['source']}, section: {m.get('title', 'unknown')}]\n{d}"
